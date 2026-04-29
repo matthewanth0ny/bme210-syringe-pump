@@ -40,7 +40,7 @@ GRIPPER_MID = config["gripper"]["zero"]
 I2C_ADDRESS = 0x60
 
 # Stepper settings
-STEPS_PER_SECOND = 3500  # push the I2C bus harder for faster aspirate/dispense
+STEPS_PER_SECOND = 3500  # I2C handled this fine over I2C
 STEP_DELAY = 1.0 / STEPS_PER_SECOND
 HOMING_BUFFER = 40  # small safety overshoot toward min, enough to home but not grind
 
@@ -54,7 +54,8 @@ with open(STEPPER_CONFIG_PATH, "r") as f:
     stepper_config = json.load(f)
 STEPPER_MIN = stepper_config["min"]
 STEPPER_MAX = stepper_config["max"]
-SYRINGE_STEPS = abs(STEPPER_MAX - STEPPER_MIN)  # total travel between min and max
+SYRINGE_FULL_STEPS = abs(STEPPER_MAX - STEPPER_MIN)
+SYRINGE_STEPS = SYRINGE_FULL_STEPS  # full travel: min → max
 
 # Load end-of-sequence push poses (tuned via arm_extend.py)
 PUSH_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "arm_extend_config.json")
@@ -68,7 +69,7 @@ PUSH_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "arm_extend_config.js
 #   BEFORE_PUSH_ELBOW_NUDGE  positive → elbow rotates physically lower
 #   PUSH_SHOULDER_NUDGE      positive → shoulder rotates physically lower
 BEFORE_PUSH_ELBOW_NUDGE = 25
-PUSH_SHOULDER_NUDGE     = 25
+PUSH_SHOULDER_NUDGE     = 90
 
 push_poses = None
 if os.path.exists(PUSH_CONFIG_PATH):
@@ -81,9 +82,11 @@ if os.path.exists(PUSH_CONFIG_PATH):
 # Cup A = base at min (-90° from home), Cup B = base at max (+90° from home)
 # Cup z is the "lowered into cup" height. Lower this to dip deeper into the cup.
 # (kinematics may refuse very low values — start with small drops.)
-CUP_Z = 100
-CUP_A = (-150, 0, CUP_Z)   # base at min
-CUP_B = (150, 0, CUP_Z)    # base at max
+# Cups sit ~2.5" (~63 mm) off the table. Lower CUP_Z to dip deeper.
+CUP_Z = 20
+CUP_REACH = 130            # |x| — pull in if arm can't reach the cup
+CUP_A = (-CUP_REACH, 0, CUP_Z)   # base at min
+CUP_B = ( CUP_REACH, 0, CUP_Z)   # base at max
 
 # Home height (raised for safe travel — must clear cup rim)
 HOME_Z = 200
@@ -261,7 +264,7 @@ def home_stepper():
     zero_servo_channels()
     switch_to_1600()
 
-    run_stepper_steps(DIR_TOWARD_MIN, SYRINGE_STEPS + HOMING_BUFFER)
+    run_stepper_steps(DIR_TOWARD_MIN, SYRINGE_FULL_STEPS + HOMING_BUFFER)
     release_stepper()
 
     switch_to_50()
@@ -273,6 +276,37 @@ def home_stepper():
 
 # Initialize meArm ONCE using config — this is the calibrated home
 arm = meArm.meArm(address=I2C_ADDRESS, logger=logger)
+
+# Pick the fastest direct-move method this meArm library version exposes.
+# Falls back to move_linear if no direct method exists.
+_direct_candidates = ["goDirectlyTo", "go_directly_to", "move_to", "moveTo",
+                      "goto", "gotoPoint", "goToPoint"]
+_direct_fn = None
+for _name in _direct_candidates:
+    if hasattr(arm, _name):
+        _direct_fn = getattr(arm, _name)
+        print(f"meArm direct-move method: {_name}")
+        break
+if _direct_fn is None:
+    print("No direct method found, using move_linear (slower).")
+    _direct_fn = arm.move_linear
+
+
+def go(x, y, z):
+    _direct_fn(x, y, z)
+
+
+# Absolute base servo angles for each cup (in 0-180° servo space).
+# Computed from mearm_config: zero + min_deg / zero + max_deg.
+BASE_ZERO = config["base"]["zero"]
+BASE_AT_CUP_A = BASE_ZERO + config["base"]["min_deg"]   # full left
+BASE_AT_CUP_B = BASE_ZERO + config["base"]["max_deg"]   # full right
+
+
+def force_base(angle):
+    """Override the base servo to an absolute angle (bypassing kinematics)."""
+    a = max(0.0, min(180.0, float(angle)))
+    ARM_SERVOS["base"].angle = a
 
 # Home the stepper to its min (fully retracted) position
 home_stepper()
@@ -286,35 +320,39 @@ try:
         # ==============================
         # Cup A: rotate over and drop in one motion
         # ==============================
+        # Cup A: rotate over (high) then snap down. Force base to full min.
         print("  Moving to Cup A (base min)...")
-        arm.move_linear(CUP_A[0], CUP_A[1], HOME_Z)    # travel high to cup A
-        arm.move_linear(CUP_A[0], CUP_A[1], CUP_A[2])  # lower into cup
+        go(CUP_A[0], CUP_A[1], HOME_Z)
+        force_base(BASE_AT_CUP_A)
+        time.sleep(0.3)
+        go(CUP_A[0], CUP_A[1], CUP_A[2])
+        force_base(BASE_AT_CUP_A)
+        time.sleep(0.2)
 
-        # Aspirate (pull water) — drive from min → max
-        print(f"  Aspirating ({SYRINGE_STEPS} steps, min → max)...")
+        print(f"  Aspirating ({SYRINGE_STEPS} steps, min → mid)...")
         do_syringe(DIR_TOWARD_MAX, SYRINGE_STEPS)
 
-        # ==============================
-        # Cup B: combined raise + rotate + lower (no intermediate stop)
-        # ==============================
+        # Raise + rotate to Cup B (full max). Override base on each step.
         print("  Moving to Cup B (base max)...")
-        arm.move_linear(CUP_B[0], CUP_B[1], HOME_Z)    # diagonal lift+rotate
-        arm.move_linear(CUP_B[0], CUP_B[1], CUP_B[2])  # lower into cup
+        go(CUP_A[0], CUP_A[1], HOME_Z)
+        force_base(BASE_AT_CUP_A)
+        go(CUP_B[0], CUP_B[1], HOME_Z)
+        force_base(BASE_AT_CUP_B)
+        time.sleep(0.3)
+        go(CUP_B[0], CUP_B[1], CUP_B[2])
+        force_base(BASE_AT_CUP_B)
+        time.sleep(0.2)
 
-        # Dispense (push water) — drive from max → min
-        print(f"  Dispensing ({SYRINGE_STEPS} steps, max → min)...")
+        print(f"  Dispensing ({SYRINGE_STEPS} steps, mid → min)...")
         do_syringe(DIR_TOWARD_MIN, SYRINGE_STEPS)
 
-        is_last_cycle = (cycle == NUM_CYCLES - 1)
-
-        if is_last_cycle:
-            print("  Final cycle — executing end push at Cup B...")
-            do_final_push()
-        else:
-            # Travel directly back over Cup A in one diagonal motion
-            arm.move_linear(CUP_A[0], CUP_A[1], HOME_Z)
+        # Always raise — push step disabled for now
+        go(CUP_B[0], CUP_B[1], HOME_Z)
+        force_base(BASE_AT_CUP_B)
+        time.sleep(0.2)
 
     print("\nSequence complete!")
 
 finally:
     release_stepper()
+    
