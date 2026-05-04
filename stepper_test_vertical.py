@@ -1,0 +1,389 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+#
+#  BME 210 Design Competition 2026 - Fluid Transport Sequence
+#  Pulls water from Cup A, deposits into Cup B, repeats.
+#
+#  Flow per cycle:
+#    Home → reach forward/down to Cup A → aspirate → back to Home
+#    Home → rotate 90° and reach down to Cup B → dispense → back to Home
+#
+#  Both meArm servos and stepper share the same PCA9685 at address 0x60.
+#  ONE PCA9685 object is used for everything — no MotorKit, no object
+#  recreation. Frequency is switched directly on the same object and
+#  servo duty cycles are saved/restored around the switch.
+
+import board
+import busio
+import json
+import logging
+import os
+import time
+import meArm
+from adafruit_pca9685 import PCA9685
+from adafruit_motor import servo
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+# --- Load meArm calibration from config ---
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "mearm_config.json")
+with open(CONFIG_PATH, "r") as f:
+    config = json.load(f)
+
+BASE_MID = config["base"]["zero"]
+SHOULDER_MID = config["shoulder"]["zero"]
+ELBOW_MID = config["elbow"]["zero"]
+GRIPPER_MID = config["gripper"]["zero"]
+
+# --- Constants ---
+I2C_ADDRESS = 0x60
+
+# Stepper settings
+STEPS_PER_SECOND = 3500  # I2C handled this fine over I2C
+STEP_DELAY = 1.0 / STEPS_PER_SECOND
+HOMING_BUFFER = 40  # small safety overshoot toward min, enough to home but not grind
+
+# Stepper directions
+DIR_TOWARD_MIN = -1  # homing / dispensing (push plunger out)
+DIR_TOWARD_MAX = 1   # aspirating (pull plunger in)
+
+# Load stepper calibration (min = empty, max = full)
+STEPPER_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "stepper_config.json")
+with open(STEPPER_CONFIG_PATH, "r") as f:
+    stepper_config = json.load(f)
+STEPPER_MIN = stepper_config["min"]
+STEPPER_MAX = stepper_config["max"]
+SYRINGE_FULL_STEPS = abs(STEPPER_MAX - STEPPER_MIN)
+SYRINGE_STEPS = SYRINGE_FULL_STEPS  # full travel: min → max
+
+# Load end-of-sequence push poses (tuned via arm_extend.py)
+PUSH_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "arm_extend_config.json")
+# Live-run nudges (degrees) added on top of the saved arm_extend_config.json
+# values so you can dial in physical motion without re-tuning.
+#
+# BEFORE_PUSH = lowering down to the cup → bias the ELBOW
+# PUSH        = extending forward to push   → bias the SHOULDER
+#
+# Sign convention (+ = larger angle written to that channel):
+#   BEFORE_PUSH_ELBOW_NUDGE  positive → elbow rotates physically lower
+#   PUSH_SHOULDER_NUDGE      positive → shoulder rotates physically lower
+BEFORE_PUSH_ELBOW_NUDGE = 25
+PUSH_SHOULDER_NUDGE     = 90
+
+push_poses = None
+if os.path.exists(PUSH_CONFIG_PATH):
+    with open(PUSH_CONFIG_PATH, "r") as f:
+        push_poses = json.load(f)
+
+# --- Positions ---
+# Base sweeps from its calibrated min to max (full 180°).
+# Shoulder and elbow still lower/raise the arm into each cup.
+# Cup A = base at min (-90° from home), Cup B = base at max (+90° from home)
+# Cup z is the "lowered into cup" height. Lower this to dip deeper into the cup.
+# (kinematics may refuse very low values — start with small drops.)
+# Cups sit ~2.5" (~63 mm) off the table. Lower CUP_Z to dip deeper.
+CUP_Z = 20
+CUP_REACH = 130            # |x| — pull in if arm can't reach the cup
+CUP_A = (-CUP_REACH, 0, CUP_Z)   # base at min
+CUP_B = ( CUP_REACH, 0, CUP_Z)   # base at max
+
+# Home height (raised for safe travel — must clear cup rim)
+HOME_Z = 200
+
+NUM_CYCLES = 4
+
+# --- PCA9685 channel mapping ---
+# meArm servo channels
+SERVO_CHANNELS = [0, 1, 14, 15]  # base, shoulder, elbow, gripper
+
+# Motor HAT M1+M2 stepper channels
+M1_PWM = 8
+M1_IN2 = 9
+M1_IN1 = 10
+M2_PWM = 13
+M2_IN2 = 12
+M2_IN1 = 11
+STEPPER_CHANNELS = [M1_PWM, M1_IN1, M1_IN2, M2_PWM, M2_IN1, M2_IN2]
+
+FULL = 0xFFFF
+OFF = 0
+
+# DOUBLE step sequence (both coils energized for more torque)
+# Each step: (IN1_A, IN2_A, IN1_B, IN2_B)
+STEP_SEQUENCE = [
+    (FULL, OFF,  FULL, OFF),   # A+, B+
+    (OFF,  FULL, FULL, OFF),   # A-, B+
+    (OFF,  FULL, OFF,  FULL),  # A-, B-
+    (FULL, OFF,  OFF,  FULL),  # A+, B-
+]
+
+# --- Single shared PCA9685 object (never recreated) ---
+i2c = busio.I2C(board.SCL, board.SDA)
+pca = PCA9685(i2c, address=I2C_ADDRESS, reference_clock_speed=25000000)
+pca.frequency = 50  # start in servo mode
+
+# Track stepper position in sequence
+step_index = 0
+
+# Servo objects on the shared pca (used only for the final extend/push)
+ARM_SERVOS = {
+    "base":     servo.Servo(pca.channels[0],  min_pulse=500, max_pulse=2500),
+    "shoulder": servo.Servo(pca.channels[1],  min_pulse=500, max_pulse=2500),
+    "elbow":    servo.Servo(pca.channels[14], min_pulse=500, max_pulse=2500),
+    "gripper": servo.Servo(pca.channels[15], min_pulse=500, max_pulse=2500),
+}
+
+
+def apply_named_pose(pose_dict, settle=1.0):
+    for name, deg in pose_dict.items():
+        clamped = max(0.0, min(180.0, float(deg)))
+        print(f"      writing {name:>8} -> {clamped:.1f}° (raw={deg:.1f})")
+        ARM_SERVOS[name].angle = clamped
+    time.sleep(settle)
+
+
+def do_final_push():
+    """Run the tuned HOME → BEFORE_PUSH → PUSH sequence at Cup B.
+
+    HOME is applied first via the SAME servo library used by arm_extend.py
+    so the arm is in the same reference frame the poses were tuned in
+    (the meArm library may map angles to different pulse widths)."""
+    if not push_poses:
+        print("  (no arm_extend_config.json found — skipping final push)")
+        return
+    # Stay at Cup B's base angle for the push — drop "base" from the poses
+    # so we don't rotate the arm away from cup B.
+    print("  BEFORE_PUSH (lowering — elbow nudge)...")
+    before = {k: v for k, v in push_poses["before_push"].items() if k != "base"}
+    saved_elbow = before.get("elbow", 90)
+    before["elbow"] = saved_elbow + BEFORE_PUSH_ELBOW_NUDGE
+    print(f"    elbow:    saved={saved_elbow:.1f}  +nudge={BEFORE_PUSH_ELBOW_NUDGE} -> {before['elbow']:.1f}")
+    apply_named_pose(before)
+    print("  PUSH (extending forward — shoulder nudge)...")
+    push = {k: v for k, v in push_poses["push"].items() if k != "base"}
+    saved_shoulder = push.get("shoulder", 90)
+    push["shoulder"] = saved_shoulder + PUSH_SHOULDER_NUDGE
+    print(f"    shoulder: saved={saved_shoulder:.1f}  +nudge={PUSH_SHOULDER_NUDGE} -> {push['shoulder']:.1f}")
+    apply_named_pose(push)
+
+
+# --- Servo save/restore ---
+
+def save_servo_state():
+    """Save current duty_cycle of all servo channels."""
+    saved = {}
+    for ch in SERVO_CHANNELS:
+        saved[ch] = pca.channels[ch].duty_cycle
+    return saved
+
+
+def zero_servo_channels():
+    """De-energize all servo channels (servos go limp, no garbage signal)."""
+    for ch in SERVO_CHANNELS:
+        pca.channels[ch].duty_cycle = 0
+    time.sleep(0.05)
+
+
+def restore_servo_state(saved_state):
+    """Write back saved duty_cycle values to servo channels."""
+    for ch, val in saved_state.items():
+        pca.channels[ch].duty_cycle = val
+    time.sleep(0.3)
+
+
+# --- Frequency switching ---
+
+def switch_to_1600():
+    """Switch PCA9685 to 1600 Hz (stepper mode).
+    Servo channels must already be zeroed before calling this."""
+    pca.frequency = 1600
+    time.sleep(0.05)
+
+
+def switch_to_50():
+    """Switch PCA9685 back to 50 Hz (servo mode).
+    Stepper channels must already be zeroed before calling this."""
+    pca.frequency = 50
+    time.sleep(0.05)
+
+
+# --- Stepper control (direct PCA9685, no MotorKit) ---
+
+def stepper_step(direction):
+    """Advance the stepper one step via H-bridge channels."""
+    global step_index
+    if direction == 1:   # forward
+        step_index = (step_index + 1) % 4
+    else:                # backward
+        step_index = (step_index - 1) % 4
+
+    in1_a, in2_a, in1_b, in2_b = STEP_SEQUENCE[step_index]
+
+    pca.channels[M1_PWM].duty_cycle = FULL
+    pca.channels[M1_IN1].duty_cycle = in1_a
+    pca.channels[M1_IN2].duty_cycle = in2_a
+    pca.channels[M2_PWM].duty_cycle = FULL
+    pca.channels[M2_IN1].duty_cycle = in1_b
+    pca.channels[M2_IN2].duty_cycle = in2_b
+
+
+def run_stepper_steps(direction, num_steps):
+    """Run stepper for a fixed number of steps. direction: 1=fwd, -1=back."""
+    for _ in range(num_steps):
+        stepper_step(direction)
+        time.sleep(STEP_DELAY)
+
+
+def release_stepper():
+    """De-energize all stepper coils."""
+    for ch in STEPPER_CHANNELS:
+        pca.channels[ch].duty_cycle = OFF
+
+
+def do_syringe(direction, num_steps):
+    """Full syringe operation: save servos → switch to 1600 Hz → step →
+    release → switch back to 50 Hz → restore servos."""
+    saved = save_servo_state()
+    zero_servo_channels()
+    switch_to_1600()
+
+    run_stepper_steps(direction, num_steps)
+    release_stepper()
+
+    switch_to_50()
+    restore_servo_state(saved)
+
+
+def home_stepper():
+    """Drive stepper backward to the min position (hard stop).
+    Extra steps past max ensure it reaches the min end regardless
+    of where it started. Steps are 'lost' harmlessly at the hard stop."""
+    print("Homing stepper to min position...")
+    saved = save_servo_state()
+    zero_servo_channels()
+    switch_to_1600()
+
+    run_stepper_steps(DIR_TOWARD_MIN, SYRINGE_FULL_STEPS + HOMING_BUFFER)
+    release_stepper()
+
+    switch_to_50()
+    restore_servo_state(saved)
+    print("Stepper homed.")
+
+
+# --- Main sequence ---
+
+# Initialize meArm ONCE using config — this is the calibrated home
+arm = meArm.meArm(address=I2C_ADDRESS, logger=logger)
+
+# Pick the fastest direct-move method this meArm library version exposes.
+# Falls back to move_linear if no direct method exists.
+_direct_candidates = ["goDirectlyTo", "go_directly_to", "move_to", "moveTo",
+                      "goto", "gotoPoint", "goToPoint"]
+_direct_fn = None
+for _name in _direct_candidates:
+    if hasattr(arm, _name):
+        _direct_fn = getattr(arm, _name)
+        print(f"meArm direct-move method: {_name}")
+        break
+if _direct_fn is None:
+    print("No direct method found, using move_linear (slower).")
+    _direct_fn = arm.move_linear
+
+
+def go(x, y, z):
+    _direct_fn(x, y, z)
+
+
+# Absolute base servo angles for each cup (in 0-180° servo space).
+# Computed from mearm_config: zero + min_deg / zero + max_deg.
+BASE_ZERO = config["base"]["zero"]
+BASE_AT_CUP_A = BASE_ZERO + config["base"]["min_deg"]   # full left
+BASE_AT_CUP_B = BASE_ZERO + config["base"]["max_deg"]   # full right
+
+
+def force_base(angle):
+    """Override the base servo to an absolute angle (bypassing kinematics)."""
+    a = max(0.0, min(180.0, float(angle)))
+    ARM_SERVOS["base"].angle = a
+
+
+# --- Vertical descent / ascent helpers ---
+# move_to interpolates in joint space, which traces an arc rather than a
+# straight vertical line. Stepping z in small increments forces a near-
+# vertical path so the syringe tube doesn't catch on the cup rim.
+
+DESCENT_STEPS  = 6     # number of intermediate waypoints between high and low
+DESCENT_DELAY  = 0.08  # pause between waypoints (seconds)
+
+
+def descend(x, y, z_top, z_bottom, base_angle):
+    """Move (x, y, z_top) -> (x, y, z_bottom) in straight vertical steps."""
+    for i in range(1, DESCENT_STEPS + 1):
+        z = z_top + (z_bottom - z_top) * (i / DESCENT_STEPS)
+        go(x, y, z)
+        force_base(base_angle)
+        time.sleep(DESCENT_DELAY)
+
+
+def ascend(x, y, z_bottom, z_top, base_angle):
+    """Reverse of descend — straight vertical lift."""
+    for i in range(1, DESCENT_STEPS + 1):
+        z = z_bottom + (z_top - z_bottom) * (i / DESCENT_STEPS)
+        go(x, y, z)
+        force_base(base_angle)
+        time.sleep(DESCENT_DELAY)
+
+# Home the stepper to its min (fully retracted) position
+home_stepper()
+
+input("\nPress Enter to begin competition sequence...")
+
+try:
+    for cycle in range(NUM_CYCLES):
+        print(f"\n--- Cycle {cycle + 1} of {NUM_CYCLES} ---")
+
+        # ==============================
+        # Cup A: arrive raised, then drop straight down
+        # ==============================
+        print("  Moving over Cup A (raised)...")
+        go(CUP_A[0], CUP_A[1], HOME_Z)
+        force_base(BASE_AT_CUP_A)
+        time.sleep(0.4)  # let arm settle at high position before descent
+
+        print("  Descending into Cup A...")
+        descend(CUP_A[0], CUP_A[1], HOME_Z, CUP_A[2], BASE_AT_CUP_A)
+        time.sleep(0.2)
+
+        print(f"  Aspirating ({SYRINGE_STEPS} steps)...")
+        do_syringe(DIR_TOWARD_MAX, SYRINGE_STEPS)
+
+        print("  Ascending out of Cup A...")
+        ascend(CUP_A[0], CUP_A[1], CUP_A[2], HOME_Z, BASE_AT_CUP_A)
+        time.sleep(0.2)
+
+        # ==============================
+        # Cup B: rotate while raised, then drop straight down
+        # ==============================
+        print("  Rotating to Cup B (raised)...")
+        go(CUP_B[0], CUP_B[1], HOME_Z)
+        force_base(BASE_AT_CUP_B)
+        time.sleep(0.4)
+
+        print("  Descending into Cup B...")
+        descend(CUP_B[0], CUP_B[1], HOME_Z, CUP_B[2], BASE_AT_CUP_B)
+        time.sleep(0.2)
+
+        print(f"  Dispensing ({SYRINGE_STEPS} steps)...")
+        do_syringe(DIR_TOWARD_MIN, SYRINGE_STEPS)
+
+        print("  Ascending out of Cup B...")
+        ascend(CUP_B[0], CUP_B[1], CUP_B[2], HOME_Z, BASE_AT_CUP_B)
+        time.sleep(0.2)
+
+    print("\nSequence complete!")
+
+finally:
+    release_stepper()
+    
